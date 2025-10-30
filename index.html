@@ -75,7 +75,10 @@
   }
   .status-dot{width:10px;height:10px;border-radius:50%;margin-top:2px;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.2)}
   .dot-ok{background:#10b981}.dot-warn{background:#f59e0b}.dot-off{background:#cbd5e1}
-  .badge{font-size:12px;padding:2px 8px;border-radius:999px;background:rgba(255,255,255,.7);border:1px solid rgba(0,0,0,.06)}
+  .badge{
+    font-size:12px;padding:2px 8px;border-radius:999px;
+    background:rgba(255,127,80,.15);border:1px solid rgba(255,127,80,.3);color:#b45309;
+  }
 </style>
 </head>
 <body>
@@ -83,13 +86,22 @@
   <header>
     <div>
       <h1>Herbstberg — Gruppenplaner</h1>
-      <div class="small" id="statusText">Live-Sync aktiv • Daten werden in der Cloud geteilt</div>
+      <div class="small" id="statusText">Live-Sync wird aufgebaut …</div>
     </div>
     <div class="right">
       <button id="exportBtn">Export (WhatsApp)</button>
       <button id="clearBtn" style="margin-left:8px;background:#ef4444">Nur dieses Gerät zurücksetzen</button>
     </div>
   </header>
+
+  <!-- Filter-Leiste -->
+  <div class="card" id="meFilterCard" style="margin-bottom:14px;display:flex;align-items:center;gap:10px">
+    <div class="small" id="meInfoText">Nicht angemeldet – erst Namen setzen</div>
+    <label style="display:flex;align-items:center;gap:6px;margin-left:auto;cursor:pointer;">
+      <input type="checkbox" id="missingOnly" />
+      <span class="small">Nur anzeigen, wo ich noch nicht mitgemacht hab</span>
+    </label>
+  </div>
 
   <!-- Nutzer / Session -->
   <section class="card" id="userCard">
@@ -165,24 +177,23 @@
     <section class="card">
       <strong>Kurzanleitung</strong>
       <ol style="margin-top:8px">
-        <li>Oben rechts: Name setzen</li>
-        <li>Listen/Umfragen erstellen, andere klicken sich rein</li>
-        <li>Export: WhatsApp-Text erzeugen</li>
+        <li>Oben Namen setzen</li>
+        <li>Listen/Umfragen erstellen</li>
+        <li>Schalter nutzen: „Nur anzeigen, wo ich noch nicht mitgemacht hab“</li>
       </ol>
-      <div style="margin-top:10px" class="small">Live-Daten werden gemeinsam in der Cloud gespeichert. Offline funktioniert es weiter und gleicht später ab.</div>
+      <div style="margin-top:10px" class="small">Daten werden in Firestore geteilt · läuft auch lokal weiter.</div>
     </section>
   </div>
 </div>
 
-<!-- Firebase + Firestore (ES Module via CDN) -->
+<!-- Firebase + App-Code -->
 <script type="module">
-/* -------- Firebase Setup -------- */
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import {
   getFirestore, doc, getDoc, setDoc, onSnapshot
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
-/* Deine Konfiguration (von dir geliefert) */
+/* deine Firebase-Daten */
 const firebaseConfig = {
   apiKey: "AIzaSyCrt9Sh5yHPeccMh0bgr-MmLb1vq8CB_xw",
   authDomain: "herbstberg-13d85.firebaseapp.com",
@@ -195,13 +206,13 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db  = getFirestore(app);
 
-/* Eine einzige „Gruppe“ (Dokument) – du kannst hier später eine ID wählen */
-const ROOM_ID = "winterberg";                // <- bei Bedarf ändern
+/* ein Raum = ein Dokument */
+const ROOM_ID = "winterberg";  // kannst du bei Bedarf ändern
 const roomRef = doc(db, "rooms", ROOM_ID);
 
-/* -------- App-Logik (wie vorher), nur Save/Load gehen über Firestore -------- */
-
 function id(){ return Math.random().toString(36).slice(2,9) }
+
+/* DOM-Refs */
 const meAvatar=document.getElementById('meAvatar')
 const meName=document.getElementById('meName')
 const nameInput=document.getElementById('nameInput')
@@ -224,67 +235,121 @@ const clearBtn=document.getElementById('clearBtn')
 const settlementEl=document.getElementById('settlement')
 const calcSettleBtn=document.getElementById('calcSettle')
 const statusText=document.getElementById('statusText')
+const missingOnly=document.getElementById('missingOnly')
+const meInfoText=document.getElementById('meInfoText')
 
-/* lokaler Cache (für Offline) */
+/* lokaler Speicher */
 const LSKEY='hb_cache_v1'
-let store = {me:null,participants:[],lists:[],polls:[],expenses:[]}
+const LOCAL_ME_KEY='hb_me_v1'
+
+let store = {
+  participants: [],
+  lists: [],
+  polls: [],
+  expenses: []
+}
+let me = loadMe()         // <- bleibt lokal
 let ready = false
-let saving = false
+let showMissingOnly = false
 const clientId = id()
 
-function saveLocal(){ localStorage.setItem(LSKEY, JSON.stringify(store)) }
-function loadLocal(){
-  try{ const s=localStorage.getItem(LSKEY); if(s) store = JSON.parse(s) }catch{}
+function loadMe(){
+  try{
+    const s = localStorage.getItem(LOCAL_ME_KEY)
+    if(s) return JSON.parse(s)
+  }catch{}
+  return null
+}
+function saveMe(){
+  localStorage.setItem(LOCAL_ME_KEY, JSON.stringify(me))
+}
+function saveLocalStore(){
+  localStorage.setItem(LSKEY, JSON.stringify(store))
+}
+function loadLocalStore(){
+  try{
+    const s = localStorage.getItem(LSKEY)
+    if(s) store = JSON.parse(s)
+  }catch{}
 }
 
-/* Firestore laden oder initial anlegen */
+/* Teilnehmer aus Cloud mit lokalem me zusammenführen */
+function mergeParticipants(cloudParticipants){
+  const merged = [...cloudParticipants]
+  if(me){
+    const exists = merged.some(p => p.id === me.id)
+    if(!exists){
+      merged.push({ id: me.id, name: me.name })
+    }
+  }
+  return merged
+}
+
+/* Cloud laden */
 async function loadFromCloud(){
   try{
     const snap = await getDoc(roomRef)
     if(snap.exists()){
-      store = snap.data().data || store
+      const cloud = snap.data().data || {}
+      store.lists    = cloud.lists    || []
+      store.polls    = cloud.polls    || []
+      store.expenses = cloud.expenses || []
+      store.participants = mergeParticipants(cloud.participants || [])
     } else {
+      // erste Initialisierung
+      store.participants = me ? [{id: me.id, name: me.name}] : []
       await setDoc(roomRef, { data: store, updatedAt: Date.now(), by: clientId })
     }
-    saveLocal()
+    saveLocalStore()
     ready = true
     renderAll()
     statusText.textContent = "Live-Sync aktiv • Daten werden in der Cloud geteilt"
-  }catch(e){
+  } catch(e){
     console.error(e)
     statusText.textContent = "Cloud nicht erreichbar – arbeite lokal"
-    loadLocal(); ready=true; renderAll()
+    loadLocalStore()
+    ready = true
+    renderAll()
   }
 }
 
-/* Live-Listener: bekommt alle Änderungen von anderen */
+/* Live-Updates aus der Cloud: mergen, nicht überschreiben */
 onSnapshot(roomRef, (snap)=>{
   if(!snap.exists()) return
-  const cloud = snap.data().data
-  // wenn wir gerade selbst speichern, übernehmen wir trotzdem die Cloud-Version
-  store = cloud
-  saveLocal()
+  const cloud = snap.data().data || {}
+  store.lists    = cloud.lists    || []
+  store.polls    = cloud.polls    || []
+  store.expenses = cloud.expenses || []
+  store.participants = mergeParticipants(cloud.participants || [])
+  saveLocalStore()
   if(ready) renderAll()
 })
 
-/* Debounced Save zur Cloud */
-let saveTimer=null
+/* Nur die gemeinsamen Daten speichern – NICHT me */
+let saveTimer = null
 function saveToCloud(){
-  saveLocal()
+  saveLocalStore()
   if(saveTimer) clearTimeout(saveTimer)
   saveTimer = setTimeout(async ()=>{
     try{
-      saving = true
-      await setDoc(roomRef, { data: store, updatedAt: Date.now(), by: clientId })
-    } catch(e){
-      console.error(e); statusText.textContent = "Speichern fehlgeschlagen – offline?"
-    } finally{
-      saving = false
+      await setDoc(roomRef, {
+        data: {
+          participants: store.participants,
+          lists: store.lists,
+          polls: store.polls,
+          expenses: store.expenses
+        },
+        updatedAt: Date.now(),
+        by: clientId
+      }, { merge: true })
+    }catch(e){
+      console.error(e)
+      statusText.textContent = "Speichern fehlgeschlagen – offline?"
     }
-  }, 200) // kleine Entzerrung
+  }, 200)
 }
 
-/* ---- UI Helfer ---- */
+/* Hilfsfunktionen */
 function miniAvatars(ids){
   const wrap=document.createElement('div'); wrap.className='mini';
   ids.slice(0,10).forEach(uid=>{
@@ -297,59 +362,89 @@ function miniAvatars(ids){
 }
 function userParticipation(uid){
   let inLists=false,inPolls=false,inExpenses=false;
-  for(const L of store.lists){ if(L.items.some(it=>it.byIDs.includes(uid))){ inLists=true; break; } }
-  for(const P of store.polls){ if(P.options.some(o=>o.votes.includes(uid))){ inPolls=true; break; } }
+  for(const L of store.lists){ if(L.items && L.items.some(it=>it.byIDs && it.byIDs.includes(uid))){ inLists=true; break; } }
+  for(const P of store.polls){ if(P.options && P.options.some(o=>o.votes && o.votes.includes(uid))){ inPolls=true; break; } }
   for(const E of store.expenses){ if(E.payerId===uid || (E.participants||[]).includes(uid)){ inExpenses=true; break; } }
   const score=[inLists,inPolls,inExpenses].filter(Boolean).length;
   return {score};
 }
 function escapeHtml(s){ return String(s).replace(/[&<>\"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c]) }
 function ensureMe(){
-  if(!store.me){
+  if(!me){
     const n=prompt('Wie heißt du?'); if(!n) return false;
-    store.me={id:id(),name:n}; store.participants.push({...store.me}); saveToCloud();
+    me = { id: id(), name: n }
+    saveMe()
+    store.participants.push({ id: me.id, name: me.name })
+    saveToCloud()
   }
   return true;
 }
 
 /* Events */
-setNameBtn.onclick=()=>{
-  const name=nameInput.value.trim(); if(!name) return alert('Bitte Namen eingeben')
-  if(!store.me){ store.me={id:id(),name}; store.participants.push({...store.me}) }
-  else{
-    store.me.name=name
-    const p=store.participants.find(x=>x.id===store.me.id); if(p) p.name=name
+setNameBtn.onclick = () => {
+  const name = nameInput.value.trim()
+  if(!name) return alert('Bitte Namen eingeben')
+  if(!me){
+    me = { id: id(), name }
+  } else {
+    me.name = name
   }
-  nameInput.value=''; saveToCloud(); renderAll()
+  saveMe()
+
+  const idx = store.participants.findIndex(p => p.id === me.id)
+  if(idx >= 0) store.participants[idx].name = me.name
+  else store.participants.push({ id: me.id, name: me.name })
+
+  nameInput.value = ''
+  saveToCloud()
+  renderAll()
 }
-addListBtn.onclick=()=>{
+
+missingOnly.onchange = () => {
+  showMissingOnly = missingOnly.checked
+  renderAll()
+}
+
+addListBtn.onclick = () => {
   const t=listTitleInput.value.trim(); if(!t) return alert('Bitte Listentitel eingeben')
-  store.lists.unshift({id:id(),title:t,items:[]}); listTitleInput.value=''; saveToCloud(); renderAll()
+  store.lists.unshift({id:id(),title:t,items:[]})
+  listTitleInput.value=''
+  saveToCloud()
+  renderAll()
 }
-createPollBtn.onclick=()=>{
+
+createPollBtn.onclick = () => {
   const q=pollTitleInput.value.trim(), opt=pollOptInput.value.trim()
   if(!q || !opt) return alert('Frage und mindestens eine Option nötig')
   store.polls.unshift({id:id(),question:q,options:[{id:id(),text:opt,votes:[]}]})
-  pollTitleInput.value=''; pollOptInput.value=''; saveToCloud(); renderAll()
+  pollTitleInput.value=''; pollOptInput.value=''
+  saveToCloud(); renderAll()
 }
-addExpenseBtn.onclick=()=>{
+
+addExpenseBtn.onclick = () => {
   const t=expenseTitle.value.trim()
   const a=parseFloat((expenseAmount.value||'').replace(',','.'))
   const payer=expensePayer.value
   if(!t || isNaN(a) || !payer) return alert('Bitte Titel, Betrag und Zahler wählen')
   store.expenses.unshift({id:id(),title:t,amount:a,payerId:payer,participants:[...store.participants.map(p=>p.id)]})
-  expenseTitle.value=''; expenseAmount.value=''; saveToCloud(); renderAll()
+  expenseTitle.value=''; expenseAmount.value=''
+  saveToCloud(); renderAll()
 }
-exportBtn.onclick=()=>{
-  const txt=buildExportText()
+
+exportBtn.onclick = () => {
+  const txt = buildExportText()
   prompt('Kopiere den Text und füge ihn in WhatsApp ein:', txt)
 }
-clearBtn.onclick=()=>{
-  if(confirm('Nur diesen Browser zurücksetzen? (Cloud-Daten bleiben erhalten)')){
-    localStorage.removeItem(LSKEY); location.reload()
+
+clearBtn.onclick = () => {
+  if(confirm('Nur diesen Browser zurücksetzen? (Cloud-Daten bleiben)')){
+    localStorage.removeItem(LOCAL_ME_KEY)
+    localStorage.removeItem(LSKEY)
+    location.reload()
   }
 }
-calcSettleBtn.onclick=()=>{
+
+calcSettleBtn.onclick = () => {
   const bal=calcBalances(), tx=settleTransactions(bal)
   settlementEl.innerHTML=''
   if(tx.length===0){
@@ -399,23 +494,82 @@ function settleTransactions(bal){
 
 /* Render */
 function renderAll(){
-  // Teilnehmer mit Statuspunkt
+  // oben: wer bin ich?
+  if (me) {
+    meInfoText.textContent = `Angemeldet als: ${me.name}`
+    missingOnly.disabled = false
+  } else {
+    meInfoText.textContent = `Nicht angemeldet – erst Namen setzen`
+    missingOnly.checked = false
+    missingOnly.disabled = true
+    showMissingOnly = false
+  }
+
+  // Teilnehmer
   participantsEl.innerHTML=''
   for(const p of store.participants){
     const d=document.createElement('div')
-    d.style.display='inline-flex'; d.style.flexDirection='column'; d.style.alignItems='center'
+    d.style.display='inline-flex'; d.style.flexDirection='column'; d.style.alignItems='center'; d.style.position='relative'
     const av=document.createElement('div'); av.className='avatar'; av.textContent=(p.name.split(' ')[0][0]||'?')
     const dot=document.createElement('div'); dot.className='status-dot'
     const part=userParticipation(p.id)
     dot.classList.add(part.score>=2?'dot-ok':(part.score===1?'dot-warn':'dot-off'))
     dot.style.marginTop='-10px'; dot.style.marginLeft='22px'; dot.style.position='relative'
     const nm=document.createElement('div'); nm.className='small'; nm.textContent=p.name
-    d.appendChild(av); d.appendChild(dot); d.appendChild(nm); participantsEl.appendChild(d)
-  }
-  meAvatar.textContent = store.me ? (store.me.name.split(' ')[0][0]||'?') : '–'
-  meName.textContent   = store.me ? store.me.name : 'Nicht gesetzt'
+    d.appendChild(av); d.appendChild(dot); d.appendChild(nm)
 
-  // Zahler-Auswahl
+    // jeder darf löschen – aber nicht sich selbst
+    if (!me || p.id !== me.id) {
+      const del = document.createElement('button')
+      del.textContent = '×'
+      del.style.position = 'absolute'
+      del.style.top = '-6px'
+      del.style.right = '-6px'
+      del.style.width = '22px'
+      del.style.height = '22px'
+      del.style.borderRadius = '50%'
+      del.style.border = 'none'
+      del.style.background = '#f43f5e'
+      del.style.color = 'white'
+      del.style.fontSize = '14px'
+      del.style.cursor = 'pointer'
+      del.onclick = () => {
+        if (!confirm(`Teilnehmer „${p.name}“ wirklich entfernen?`)) return
+
+        // 1. aus Teilnehmern
+        store.participants = store.participants.filter(x => x.id !== p.id)
+        // 2. aus Listen
+        for (const L of store.lists) {
+          for (const it of (L.items || [])) {
+            it.byIDs = (it.byIDs || []).filter(id => id !== p.id)
+          }
+        }
+        // 3. aus Umfragen
+        for (const P of store.polls) {
+          for (const o of (P.options || [])) {
+            o.votes = (o.votes || []).filter(id => id !== p.id)
+          }
+        }
+        // 4. aus Ausgaben
+        for (const E of store.expenses) {
+          E.participants = (E.participants || []).filter(id => id !== p.id)
+          if (E.payerId === p.id) {
+            const fallback = store.participants[0]
+            E.payerId = fallback ? fallback.id : null
+          }
+        }
+        saveToCloud()
+        renderAll()
+      }
+      d.appendChild(del)
+    }
+
+    participantsEl.appendChild(d)
+  }
+  meAvatar.textContent = me ? (me.name.split(' ')[0][0]||'?') : '–'
+  meName.textContent   = me ? me.name : 'Nicht gesetzt'
+
+  // Zahler
   expensePayer.innerHTML='<option value="">Zahler wählen</option>'
   for(const p of store.participants){
     const o=document.createElement('option'); o.value=p.id; o.textContent=p.name; expensePayer.appendChild(o)
@@ -424,32 +578,52 @@ function renderAll(){
   // Listen
   listsEl.innerHTML=''
   for(const L of store.lists){
+    // hat ME hier teilgenommen?
+    let meContributedHere = false
+    if (me) {
+      for (const it of (L.items || [])) {
+        if (it.byIDs && it.byIDs.includes(me.id)) {
+          meContributedHere = true
+          break
+        }
+      }
+    }
+    // Filter: nur die, wo ich noch nicht drin bin
+    if (showMissingOnly && me && meContributedHere) {
+      continue
+    }
+
     const box=document.createElement('div'); box.className='item'
     const title=document.createElement('div'); title.style.flex='1'
-    const count=document.createElement('div'); count.className='small'
     title.innerHTML=`<strong>${escapeHtml(L.title)}</strong>`
+    if (me && !meContributedHere) {
+      const tag = document.createElement('span')
+      tag.className='badge'
+      tag.textContent='du fehlst hier'
+      tag.style.marginLeft='6px'
+      title.appendChild(tag)
+    }
+
+    const count=document.createElement('div'); count.className='small'
     const btnAddItem=document.createElement('button'); btnAddItem.textContent='Eintrag'
     btnAddItem.onclick=()=>{
       if(!ensureMe()) return
       const txt=prompt('Eintragstext (z. B. "Zewa")'); if(!txt) return
-      L.items.unshift({id:id(),text:txt,byIDs:[store.me.id]}); saveToCloud(); renderAll()
+      if (!L.items) L.items = []
+      L.items.unshift({id:id(),text:txt,byIDs:[me.id]}); saveToCloud(); renderAll()
     }
-    // Beteiligung
     const contributed=new Set()
-    for(const it of L.items){ for(const u of it.byIDs){ contributed.add(u) } }
+    for(const it of (L.items || [])){ for(const u of (it.byIDs || [])){ contributed.add(u) } }
     const total=store.participants.length
     count.textContent=`${contributed.size}/${total} beteiligt`
-
-    // Avatare der Beitragenden
     const avWrap=miniAvatars([...contributed])
 
-    // Items
     const mini=document.createElement('div'); mini.className='small'; mini.style.marginTop='6px'
-    if(L.items.length===0) mini.textContent='Noch keine Einträge'
+    if(!L.items || L.items.length===0) mini.textContent='Noch keine Einträge'
     else{
       mini.innerHTML=L.items.map(it=>{
-        const mine=store.me && it.byIDs.includes(store.me.id)
-        const who=it.byIDs.map(id=> (store.participants.find(p=>p.id===id)||{name:'?'}).name.split(' ')[0]).join(', ')
+        const mine=me && (it.byIDs||[]).includes(me.id)
+        const who=(it.byIDs||[]).map(id=> (store.participants.find(p=>p.id===id)||{name:'?'}).name.split(' ')[0]).join(', ')
         return `<div style="display:flex;gap:8px;align-items:center;margin-bottom:4px">
           <input type="checkbox" ${mine?'checked':''} data-listid="${L.id}" data-itemid="${it.id}" class="markChk"/>
           <div style="flex:1">${escapeHtml(it.text)} <span class="small" style="color:#94a3b8">(${who})</span></div>
@@ -465,45 +639,63 @@ function renderAll(){
     const container=document.createElement('div'); container.appendChild(wrap); container.appendChild(mini)
     listsEl.appendChild(container)
   }
-  // Checkbox-Toggle (Beteiligung pro Item)
   document.querySelectorAll('.markChk').forEach(chk=>{
     chk.onclick=()=>{
       if(!ensureMe()) return
       const listid=chk.dataset.listid, itemid=chk.dataset.itemid
       const L=store.lists.find(x=>x.id===listid); if(!L) return
       const it=L.items.find(x=>x.id===itemid); if(!it) return
-      const uid=store.me.id
-      if(it.byIDs.includes(uid)) it.byIDs=it.byIDs.filter(x=>x!==uid)
-      else it.byIDs.push(uid)
+      it.byIDs = it.byIDs || []
+      if(it.byIDs.includes(me.id)) it.byIDs=it.byIDs.filter(x=>x!==me.id)
+      else it.byIDs.push(me.id)
       saveToCloud(); renderAll()
     }
   })
 
-  // Umfragen (Mehrfachauswahl)
+  // Umfragen (Mehrfach)
   pollsEl.innerHTML=''
   for(const P of store.polls){
+    // hat ME hier abgestimmt?
+    let meVotedHere = false
+    if (me) {
+      for (const o of (P.options || [])) {
+        if (o.votes && o.votes.includes(me.id)) {
+          meVotedHere = true
+          break
+        }
+      }
+    }
+    if (showMissingOnly && me && meVotedHere) {
+      continue
+    }
+
     const box=document.createElement('div'); box.className='item'
     const q=document.createElement('div'); q.style.flex='1'
-    q.innerHTML=`<strong>${escapeHtml(P.question)}</strong><div class="small" style="margin-top:6px">${P.options.length} Optionen · Mehrfachauswahl</div>`
+    q.innerHTML=`<strong>${escapeHtml(P.question)}</strong>`
+    if (me && !meVotedHere) {
+      const tag=document.createElement('span')
+      tag.className='badge'
+      tag.textContent='du hast noch nicht abgestimmt'
+      tag.style.marginLeft='6px'
+      q.appendChild(tag)
+    }
     const optPane=document.createElement('div'); optPane.style.width='280px'; optPane.style.display='flex'; optPane.style.flexDirection='column'; optPane.style.gap='6px'
-    for(const o of P.options){
-      const voted = store.me && o.votes.includes(store.me.id)
+    for(const o of (P.options || [])){
+      const voted = me && (o.votes||[]).includes(me.id)
       const btn=document.createElement('button')
       btn.style.background= voted ? 'linear-gradient(90deg,#22c55e,#16a34a)' : '#ffffff'
       btn.style.color= voted ? '#fff' : '#0f172a'
       btn.style.border= voted ? 'none' : '1px solid #e5e7eb'
-      btn.textContent = `${o.text} (${o.votes.length})${voted?' ✓':''}`
+      btn.textContent = `${o.text} (${(o.votes||[]).length})${voted?' ✓':''}`
       btn.onclick=()=>{
         if(!ensureMe()) return
-        // Mehrfachauswahl: nur toggeln, NICHT andere entfernen
-        const uid=store.me.id
-        if(o.votes.includes(uid)) o.votes=o.votes.filter(x=>x!==uid)
-        else o.votes.push(uid)
+        o.votes = o.votes || []
+        if(o.votes.includes(me.id)) o.votes=o.votes.filter(x=>x!==me.id)
+        else o.votes.push(me.id)
         saveToCloud(); renderAll()
       }
       optPane.appendChild(btn)
-      // Mini-Avatare der Voter
-      const votersWrap=miniAvatars(o.votes.slice())
+      const votersWrap=miniAvatars((o.votes||[]).slice())
       optPane.appendChild(votersWrap)
     }
     const addOptBtn=document.createElement('button'); addOptBtn.textContent='Option hinzufügen'; addOptBtn.style.background='#efefef'; addOptBtn.style.color='#111'
@@ -513,7 +705,7 @@ function renderAll(){
     pollsEl.appendChild(box)
   }
 
-  // Ausgaben-List
+  // Ausgaben
   expensesEl.innerHTML=''
   for(const E of store.expenses){
     const box=document.createElement('div'); box.className='item'
@@ -522,42 +714,42 @@ function renderAll(){
     const payerName=(store.participants.find(p=>p.id===E.payerId)||{name:'?'}).name
     const right=document.createElement('div'); right.style.minWidth='260px'; right.style.display='flex'; right.style.flexDirection='column'; right.style.gap='6px'
     const who=document.createElement('div'); who.className='small'; who.textContent=`Bezahlt: ${payerName}`
-    const parts=document.createElement('div'); parts.className='small'; parts.textContent=`Beteiligte: ${E.participants.length}`
+    const parts=document.createElement('div'); parts.className='small'; parts.textContent=`Beteiligte: ${(E.participants||[]).length}`
     right.appendChild(who); right.appendChild(parts)
     box.appendChild(left); box.appendChild(right)
     expensesEl.appendChild(box)
   }
 }
 
-/* Export-Text */
 function buildExportText(){
-  let out = `Herbstberg – Gruppenübersicht\\n\\n`
-  out += `Teilnehmer:\\n` + store.participants.map(p=>`- ${p.name}`).join('\\n') + '\\n\\n'
-  out += `Listen:\\n`
+  let out = `Herbstberg – Gruppenübersicht\n\n`
+  out += `Teilnehmer:\n` + store.participants.map(p=>`- ${p.name}`).join('\n') + '\n\n'
+  out += `Listen:\n`
   for(const L of store.lists){
-    out += `* ${L.title}\\n`
-    if(L.items.length===0) out += `  (noch leer)\\n`
+    out += `* ${L.title}\n`
+    if(!L.items || L.items.length===0) out += `  (noch leer)\n`
     else for(const it of L.items){
-      const who = it.byIDs.map(id=> (store.participants.find(p=>p.id===id)||{name:'?'}).name.split(' ')[0]).join(', ')
-      out += `  - ${it.text} (${who})\\n`
+      const who = (it.byIDs||[]).map(id=> (store.participants.find(p=>p.id===id)||{name:'?'}).name.split(' ')[0]).join(', ')
+      out += `  - ${it.text} (${who})\n`
     }
   }
-  out += `\\nUmfragen (Mehrfachauswahl):\\n`
+  out += `\nUmfragen (Mehrfachauswahl):\n`
   for(const P of store.polls){
-    out += `* ${P.question}\\n`
-    for(const o of P.options) out += `  - ${o.text} (${o.votes.length})\\n`
+    out += `* ${P.question}\n`
+    for(const o of (P.options||[])) out += `  - ${o.text} (${(o.votes||[]).length})\n`
   }
-  out += `\\nAusgaben:\\n`
+  out += `\nAusgaben:\n`
   for(const E of store.expenses){
     const payer=(store.participants.find(p=>p.id===E.payerId)||{name:'?'}).name
-    out += `* ${E.title} — ${E.amount.toFixed(2)} € — bezahlt von ${payer}\\n`
+    out += `* ${E.title} — ${E.amount.toFixed(2)} € — bezahlt von ${payer}\n`
   }
   return out
 }
 
 /* Start */
-loadLocal(); renderAll();   // zeigt ggf. Cache, bis Cloud kommt
-loadFromCloud();            // lädt/initialisiert Cloud & startet Live-Listener
+loadLocalStore()
+renderAll()
+loadFromCloud()
 </script>
 </body>
 </html>
